@@ -1702,6 +1702,29 @@ function discardRewrittenQuery(c: QueryContext): void {
 	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
 }
 
+/** Close every Claude Code query still open when pi shuts down.
+ *
+ *  A tool whose result ends pi's turn (`terminate: true`) leaves its MCP handler
+ *  parked: pi never makes the provider call that would deliver the result. On a
+ *  signal, pi's teardown kills the child; a clean exit (print mode) has nothing
+ *  else that will, and the live subprocess keeps pi's event loop running. */
+function closeActiveQueries(reason: string): void {
+	for (const c of activeQueryContexts) {
+		const open = c.activeQuery as { interrupt?: () => Promise<unknown>; close?: () => void } | null;
+		if (open) abandonedQueries.add(open);
+		c.activeQuery = null;
+		c.turnToolCallIds = [];
+		c.promptStream?.fail(new Error(reason));
+		c.promptStream = null;
+		// Settle parked handlers before killing the CLI: one left awaiting a dead
+		// subprocess never settles.
+		c.releasePendingToolCalls(reason);
+		void open?.interrupt?.().catch(() => {});
+		try { open?.close?.(); } catch {}
+	}
+	activeQueryContexts.clear();
+}
+
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -2464,6 +2487,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", () => {
 		reportLeaks("session_shutdown");
+		closeActiveQueries("pi session shut down");
 		clearSession("session_shutdown");
 	});
 
