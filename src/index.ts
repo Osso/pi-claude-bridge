@@ -1702,14 +1702,20 @@ function discardRewrittenQuery(c: QueryContext): void {
 	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
 }
 
-/** Close every Claude Code query still open when pi shuts down.
+/** Close the Claude Code queries still open for a pi session that is shutting down.
  *
  *  A tool whose result ends pi's turn (`terminate: true`) leaves its MCP handler
  *  parked: pi never makes the provider call that would deliver the result. On a
  *  signal, pi's teardown kills the child; a clean exit (print mode) has nothing
- *  else that will, and the live subprocess keeps pi's event loop running. */
-function closeActiveQueries(reason: string): void {
+ *  else that will, and the live subprocess keeps pi's event loop running.
+ *
+ *  Scoped to that session: pi emits session_shutdown for every child agent that
+ *  finishes, in the same process as its parent. Closing the parent's query marks
+ *  it abandoned, its completion never ends pi's stream, and the parent's turn
+ *  hangs until pi's thinking-phase watchdog aborts it. */
+function closeActiveQueries(piSessionId: string | null, reason: string): void {
 	for (const c of activeQueryContexts) {
+		if (c.piSessionId !== piSessionId) continue;
 		const open = c.activeQuery as { interrupt?: () => Promise<unknown>; close?: () => void } | null;
 		if (open) abandonedQueries.add(open);
 		c.activeQuery = null;
@@ -1721,8 +1727,8 @@ function closeActiveQueries(reason: string): void {
 		c.releasePendingToolCalls(reason);
 		void open?.interrupt?.().catch(() => {});
 		try { open?.close?.(); } catch {}
+		activeQueryContexts.delete(c);
 	}
-	activeQueryContexts.clear();
 }
 
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
@@ -2485,9 +2491,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		reportLeaks("session_shutdown");
-		closeActiveQueries("pi session shut down");
+		closeActiveQueries(ctx.sessionManager.getSessionId(), "pi session shut down");
 		clearSession("session_shutdown");
 	});
 
