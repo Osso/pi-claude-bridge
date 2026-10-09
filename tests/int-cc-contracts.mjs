@@ -330,6 +330,43 @@ test("a streamed prompt keeps the query open past result until the input generat
 		`the SDK closed stdin on its own ${exitAt - resultAt}ms after result — a streamed prompt no longer parks the query, so steering is dead`);
 });
 
+test("a PostToolBatch hook returning continue:false ends the turn after a tool result, without another model request", { timeout: 180_000 }, async () => {
+	// A Pi run that ends on a tool (end_turn) leaves CC parked on that call. closeEndedTurns
+	// answers it with this hook so CC ends its turn without asking the model again, and the
+	// next Pi prompt opens a fresh query as a real user turn rather than a mid-turn steer.
+	const calls = [];
+	const requestIds = new Set();
+	const toolResults = [];
+	let sessionId = null;
+	let result = null;
+	for await (const message of query({
+		prompt: "Call the finish tool exactly once.",
+		options: providerOptions({
+			mcpServers: toolServer([noArgTool("finish")], calls),
+			hooks: { PostToolBatch: [{ hooks: [async () => ({ continue: false })] }] },
+		}),
+	})) {
+		if (message.type === "system" && message.subtype === "init") sessionId = message.session_id;
+		if (message.type === "assistant") requestIds.add(message.message.id);
+		if (message.type === "user" && Array.isArray(message.message?.content)) {
+			for (const block of message.message.content) if (block.type === "tool_result") toolResults.push(block);
+		}
+		if (message.type === "result") result = message;
+	}
+
+	assert.equal(calls.length, 1, "the tool was not called exactly once");
+	assert.equal(toolResults.length, 1, "CC did not record the tool result");
+	assert.equal(requestIds.size, 1, `CC asked the model again after the tool result (${requestIds.size} model messages)`);
+	assert.ok(result, "no result message — the turn did not end");
+
+	// The ended turn keeps the tool result: a resumed prompt sees it as history.
+	const resumed = await collect(query({
+		prompt: "What exact text did the finish tool return? Reply with only that text.",
+		options: providerOptions({ resume: sessionId, mcpServers: toolServer([noArgTool("finish")], []) }),
+	}));
+	assert.match(resumed.result?.result ?? "", /finish-VALUE/);
+});
+
 // --- The in-process MCP server ---
 
 test("the SDK treats our McpServer as an opaque endpoint — it only calls connect", { timeout: 120_000 }, async () => {

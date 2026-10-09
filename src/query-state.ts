@@ -138,6 +138,11 @@ export class QueryContext {
 	/** A steer never reached CC. A first query has no session mirror yet, so
 	 *  completion must carry this into the mirror it creates. */
 	missedSteer = false;
+	/** pi's run ended on this query's tool call. Its PostToolBatch hook stops CC there, so the
+	 *  next prompt opens a new turn instead of steering into this one. */
+	turnEnded = false;
+	/** Settles when this query's CLI has finished and its session state is recorded. */
+	settled: Promise<unknown> | null = null;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
