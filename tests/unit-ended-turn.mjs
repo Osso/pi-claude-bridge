@@ -50,9 +50,10 @@ async function connectClient(server) {
 function fakeQuery(options, prompt, body) {
 	const record = { options, prompts: [], hookDecisions: [], reaskedModel: false };
 	queries.push(record);
+	// Aborting fails the prompt stream; the SDK's stdin pump just stops reading.
 	void (async () => {
 		for await (const message of prompt) record.prompts.push(message);
-	})();
+	})().catch(() => {});
 	const generator = body(record);
 	generator.interrupt = async () => {};
 	generator.close = () => {};
@@ -159,6 +160,40 @@ describe("a pi run that ended on a tool", () => {
 		const written = fdTranscripts();
 		assert.deepEqual(written, [], `the bridge rewrote the session transcript: ${written.join(", ")}`);
 		assert.equal(answer.content.find((part) => part.type === "text")?.text, "It samples nightly turns.");
+	});
+
+	it("lets the user abort a Claude Code that never finishes the ended turn", async () => {
+		let closed = false;
+		let unblock;
+		__test.setQuery(({ options, prompt }) => {
+			const generator = fakeQuery(options, prompt, async function* (record) {
+				yield { type: "system", subtype: "init", session_id: "cc-stalled" };
+				yield streamEvent({ type: "message_start", message: { id: "msg-stalled", usage: {} } });
+				yield streamEvent({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_end", name: "mcp__custom-tools__end_turn", input: {} } });
+				yield streamEvent({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"reason":"answered"}' } });
+				yield streamEvent({ type: "content_block_stop", index: 0 });
+				yield streamEvent({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: {} });
+				yield streamEvent({ type: "message_stop" });
+				const callTool = await connectClient(Object.values(record.options.mcpServers)[0]);
+				await callTool("end_turn", { reason: "answered" }, "toolu_end");
+				// CC got the result but never runs its hook or ends the turn.
+				await new Promise((resolve) => { unblock = resolve; });
+			});
+			generator.close = () => { closed = true; unblock?.(); };
+			return generator;
+		});
+		const run = piRunMessages();
+		const controller = new AbortController();
+		await provider.streamSimple(provider.models[0], { messages: run.slice(0, 1), tools: [END_TURN] }, { sessionId: PI_SESSION, signal: controller.signal }).result();
+
+		let ended = false;
+		const agentEnd = Promise.resolve(handlers.get("agent_end")({ type: "agent_end", messages: run }, piContext)).then(() => { ended = true; });
+		await settle();
+		assert.equal(ended, false, "agent_end returned before CC settled");
+
+		controller.abort();
+		await agentEnd;
+		assert.equal(closed, true, "aborting left the stalled CC process running");
 	});
 
 	it("still steers a message the user sent while the run was going", async () => {
