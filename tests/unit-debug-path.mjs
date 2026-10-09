@@ -23,6 +23,16 @@ describe("test harness", () => {
 	});
 });
 
+describe("test home isolation", () => {
+	it("gives every unit test process a throwaway home, agent dir and Claude config", async () => {
+		const { homedir } = await import("node:os");
+		const home = homedir();
+		assert.match(home, /claude-bridge-test-home-/, "HOME must be the preload's temp home, not the developer's");
+		assert.ok(getAgentDir().startsWith(home), "Pi agent dir (claude-bridge.json accountProfiles) must live in the temp home");
+		assert.equal(process.env.CLAUDE_CONFIG_DIR, undefined, "Claude credentials must resolve under the temp home");
+	});
+});
+
 describe("log paths", () => {
 	it("follow PI_CODING_AGENT_DIR when no debug path override is set", () => {
 		// log-paths.ts resolves at import time, so read it from a fresh process.
