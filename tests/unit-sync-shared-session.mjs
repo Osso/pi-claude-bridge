@@ -72,13 +72,11 @@ describe("syncSharedSession", () => {
 		}
 	});
 
-	// The branch this exercises is the guard that stops a reentrant subagent from
-	// resuming — and then overwriting — the parent's session: a subagent's context
-	// is shorter than the parent's cursor, so it starts fresh and the parent's
-	// session is preserved. It was previously described here as the compact-summary
-	// path, which cannot reach syncSharedSession at all, so the branch read as
-	// covered for a case that never happens.
-	it("starts a fresh session for a shorter context and preserves the parent's", () => {
+	// Callers without a pi session ID share the "(none)" bucket (AskClaude and
+	// unowned reentrant calls). Short contexts must not resume or overwrite its
+	// longer conversation. Session-owned mirrors instead rebuild from pi history.
+	// Isolated compact summaries never reach syncSharedSession.
+	it("starts a fresh session for a shorter unowned context and preserves the shared bucket", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
 		try {
 			const mainSession = {

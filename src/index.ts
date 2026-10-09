@@ -951,23 +951,14 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 		return { sessionId: sharedSession.sessionId };
 		}
 	}
-	// This is what keeps a caller with a pruned or short context from resuming
-	// — then overwriting — the bucket's session: shorter-than-cursor means the
-	// incoming history cannot be a continuation, so start clean and preserve.
-	// Historically this also caught reentrant subagents (a subagent's priors are
-	// shorter than the parent's cursor); with per-session mirrors it now catches
-	// the pruned-context shapes on a session's own bucket, and the non-isolated
-	// AskClaude path on the "(none)" bucket. The captured ephemeral session is
-	// deleted once its query completes (see preserveSharedSession in the
-	// completion handler).
-	//
-	// It is NOT, despite an earlier comment here, the isolated compact-summary
-	// path: runIsolatedSummary never calls syncSharedSession at all.
-	//
-	// Only reachable when needsRebuild is false — user-facing history rewrites
-	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
-	// sharedSession before the next syncSharedSession call.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
+	// The unowned "(none)" bucket can serve short AskClaude/reentrant contexts
+	// unrelated to its longer conversation. Start clean and preserve that bucket;
+	// completion deletes the ephemeral session (see preserveSharedSession).
+	// A session-owned mirror instead rebuilds below from pi's authoritative history:
+	// runtime-only messages such as the end_turn nudge can disappear without a
+	// history-rewrite event. Neither case may REUSE the longer CC history (issue #25).
+	// Isolated summaries never reach this function.
+	if (piSessionId == null && sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
 		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
 		return { sessionId: null, preserveSharedSession: true };

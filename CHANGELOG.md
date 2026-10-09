@@ -2,7 +2,7 @@
 
 ## UNRELEASED
 
-- **Fix: replies missing after a turn ends on a tool** — when pi's run ends on a terminating tool (`end_turn`), Claude Code stayed parked on that call, and the next prompt reached it as a mid-turn steer ("address it as you continue this turn"), which the model often answered only in thinking. At `agent_end` the bridge now answers the call with pi's recorded result and a `PostToolBatch` hook stops CC without another model request, so the next prompt is a normal user turn on the same session.
+- **Fix: replies missing after a turn ends on a tool** — when pi's run ends on a terminating tool (`end_turn`), Claude Code stayed parked on that call, and the next prompt reached it as a mid-turn steer ("address it as you continue this turn"), which the model often answered only in thinking. At `agent_end` the bridge now answers the call with pi's recorded result and a `PostToolBatch` hook stops CC without another model request, so the next prompt is a normal user turn on the same session. If pi's runtime-only end-turn nudge inflated the cursor, the session-owned mirror rebuilds from pi's recorded history instead of starting the next turn without prior conversation; shorter unowned AskClaude contexts still preserve their shared bucket.
 
 - **Add: current-account Claude `/usage` reporting** — Pi's built-in dispatcher event `claude-bridge:usage-request` reports selected-account subscription windows and UTC reset times from Anthropic's OAuth usage API without switching accounts. Bounded transient retries honor `Retry-After`; unresolved HTTP 429 reports the API status and retry timing. `/usage reset` is unsupported for Claude.
 

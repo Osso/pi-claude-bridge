@@ -12,7 +12,9 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { deleteSession, getSessionPath } from "cc-session-io";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -160,6 +162,41 @@ describe("a pi run that ended on a tool", () => {
 		const written = fdTranscripts();
 		assert.deepEqual(written, [], `the bridge rewrote the session transcript: ${written.join(", ")}`);
 		assert.equal(answer.content.find((part) => part.type === "text")?.text, "It samples nightly turns.");
+	});
+
+	it("rebuilds conversation history after an unpersisted end_turn nudge", async () => {
+		const sessionId = randomUUID();
+		const firstUser = user("first-user-message marker: remember nightly samples", 1);
+		const scripts = [
+			(record) => textAnswer(record, sessionId, "It samples nightly turns."),
+			(record) => endTurnCall(record, sessionId),
+			(record) => textAnswer(record, record.options.resume ?? randomUUID(), "I remember nightly samples."),
+		];
+		__test.setQuery(({ options, prompt }) => fakeQuery(options, prompt, scripts.shift()));
+		try {
+			const answer = await turn([firstUser]).result();
+			assert.equal(answer.stopReason, "stop");
+			const history = [firstUser, answer];
+			const nudge = user("Your previous response was already delivered. Do not continue, repeat, or infer a new user request. Call `end_turn` now with a concise reason.", 2);
+			const ended = await turn([...history, nudge]).result();
+			assert.equal(ended.stopReason, "toolUse");
+			const toolResult = piRunMessages().at(-1);
+			// Pi persists the end_turn call and result, but never the runtime-only nudge.
+			const persisted = [...history, ended, toolResult];
+			await handlers.get("agent_end")({ type: "agent_end", messages: persisted }, piContext);
+			await settle();
+			assert.equal(queries[1].reaskedModel, false, "the nudge's tool call must close through agent_end");
+
+			const next = await turn([...persisted, user("what did I ask you to remember?", 4)]).result();
+			assert.ok(queries[2].options.resume, "the next turn must resume imported history, not start with only its prompt");
+			const transcript = readFileSync(getSessionPath(queries[2].options.resume, process.cwd(), process.env.CLAUDE_CONFIG_DIR), "utf8");
+			assert.match(transcript, /first-user-message marker: remember nightly samples/);
+			assert.match(transcript, /It samples nightly turns/);
+			assert.doesNotMatch(transcript, /Your previous response was already delivered/);
+			assert.equal(next.content.find((part) => part.type === "text")?.text, "I remember nightly samples.");
+		} finally {
+			deleteSession(sessionId, process.cwd(), process.env.CLAUDE_CONFIG_DIR);
+		}
 	});
 
 	it("lets the user abort a Claude Code that never finishes the ended turn", async () => {
