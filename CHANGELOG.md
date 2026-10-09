@@ -2,6 +2,10 @@
 
 ## UNRELEASED
 
+- **Add: current-account Claude `/usage` reporting** — Pi's built-in dispatcher event `claude-bridge:usage-request` reports selected-account subscription windows and UTC reset times from Anthropic's OAuth usage API without switching accounts. Bounded transient retries honor `Retry-After`; unresolved HTTP 429 reports the API status and retry timing. `/usage reset` is unsupported for Claude.
+
+- **Add: opt-in quota-only provider account rotation** — `provider.accountProfiles` selects explicit existing named profiles with per-subprocess `CLAUDE_CONFIG_DIR` credential isolation and refresh writeback. Explicit quota failures advance to an eligible account for Pi's default retry, continuing from recorded tool results. Rejected accounts become eligible at their reported reset time; missing reset times remain blocked for the process lifetime, and exhaustion stops rotation. The selected account and dated rejections persist in `~/.config/pi-claude-bridge/account-state/` (one file per process, merged on read), shared by every bridge process, so new and restarted sessions start on the account that last worked instead of retrying an exhausted one. Isolated one-off calls (compaction summaries, session titles) use the same selection and rotate within the call on a quota rejection. AskClaude is not covered.
+
 - **Fix: system prompt sections survive prompt capture (issue #153)** — pi 0.99.2+ adds an `mcp_servers` section through its MCP extension. The transcript replay now ranks unlisted sections after the built-ins, matching pi's builder, so the capture key matches instead of failing every turn; and recorded sections are projected to Claude Code instead of being silently dropped. The failure message points at a section-order divergence instead of blaming extension load order.
 - **Fix: duplicate AGENTS.md instructions (#151)** — Exclude Claude Code's native copy, matching the existing CLAUDE.md exclusions.
 

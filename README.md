@@ -33,6 +33,14 @@ The model list comes from pi-ai's Anthropic catalog automatically — when pi-ai
 
 **1M Context:** Fable 5/5.1, Opus 5.5/5/4.8/4.7, and Sonnet 5.5/5 get 1M context. Opus 4.6 gets 1M only on a Max plan or with Extra Usage, and Sonnet 4.6 only with Extra Usage — set `provider.plan` and/or `provider.longContextExtraUsage` as described in [Configuration](#configuration).
 
+## Account usage
+
+With a `claude-bridge` model selected, `/usage` reports the currently selected account's subscription quota, not session token usage: 5-hour, 7-day, 7-day Opus, and 7-day Sonnet utilization with reset timestamps in UTC. Unavailable windows or reset times are labeled unavailable. With `provider.accountProfiles`, the report uses the bridge's current selection; otherwise it uses the current Claude credentials. Reporting does not switch accounts or advance quota rotation.
+
+The source is Anthropic's OAuth usage API (`GET https://api.anthropic.com/api/oauth/usage`). Transient network failures, HTTP 429, and server errors receive bounded retries respecting `Retry-After`; an unresolved 429 reports the API status and supplied retry delay/deadline, not an inferred subscription reset.
+
+Requires Pi's built-in `/usage` dispatcher emitting `claude-bridge:usage-request`; the bridge handles that event rather than registering a competing slash command. `/usage reset` and other arguments are unsupported for Claude: the bridge cannot reset subscription quota or consume reset credits.
+
 ## AskClaude Tool
 
 Opt-in: set `askClaude.enabled` to `true` (see [Configuration](#configuration)). Available when using any non-claude-bridge provider. Pi's LLM can delegate tasks to Claude Code and wait for it to answer a question or perform a task. Examples of how to use:
@@ -84,6 +92,7 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `appendSkills` — forward pi's skills block into the system prompt (default `true`)
 
 `provider`:
+- `accountProfiles` — explicit ordered list of existing named credential profiles; enables quota-only provider rotation (see below). Unset by default.
 - `plan` (default `"pro"`) — set to `"max"` if you have a Max (or Team Premium/Enterprise) Anthropic plan. This enables Opus with 1M context.
 - `longContextExtraUsage` — set to `true` to enable 1M context models even if they cost money through Extra Usage on your plan. It enables Sonnet 4.6 with 1M on every plan and Opus 4.6 with 1M on Pro. Not needed for Opus 4.7 or 4.8.
 - `forceTwoHundredK` — array of model ids to pin to 200K context (bare id, no `[1m]` suffix). Use if pi-ai declares a model at 1M but Claude Code won't serve it on your plan.
@@ -91,6 +100,28 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `autoMemoryEnabled` — enable Claude Code's auto-memory system (default `false`)
 - `pathToClaudeCodeExecutable` — path to the `claude` binary. Useful if your OS/filesystem has the SDK's bundled musl/glibc binaries in a place where they can't run. For example, with Nix you can set the binary to e.g. `"/home/you/.nix-profile/bin/claude"`.
 
+
+### Account profiles: quota-only rotation
+
+Opt in with existing saved profiles at `~/.claude/<name>.credentials.json`. Names must be unique and contain only letters, digits, underscores or hyphens, starting with a letter or digit. The bridge does not discover accounts or log them in. The selected account and dated quota rejections are shared by every bridge process through `~/.config/pi-claude-bridge/account-state/`, one `<pid>.json` per process merged on read (newest selection, latest reset per account), so a new or restarted session keeps the account that last worked and skips accounts still over their limit; delete the directory to reset selection. Without that file, if `~/.claude/.active-profile` names a configured profile, it starts there; otherwise it starts with the first entry.
+
+Example local server configuration in that server user's `~/.pi/agent/claude-bridge.json` (not a global default):
+
+```json
+{
+  "provider": {
+    "accountProfiles": ["alessio", "claude-agent", "gc"]
+  }
+}
+```
+
+Each provider subprocess gets its own profile's `CLAUDE_CONFIG_DIR` at `~/.config/pi-claude-bridge/profiles/<name>`. Credentials are initialized from the saved profile (or the live credentials when that profile is active). Refreshes are written back after the query settles only if the saved profile has not changed. Detected concurrent credential updates fail explicitly; external tools do not share a lock, so avoid logging in or switching profiles during bridge queries. Other Claude configuration and project sessions are shared through symlinks. The generated `policy-limits.json.stamp.json` stays profile-local because Claude replaces it atomically; the actual policy remains shared. This isolates credentials, not all Claude state; it does not switch `~/.claude/.credentials.json`, change the active-profile marker, or mutate the parent environment. Keep credential contents out of bridge configuration.
+
+Only a failed query preceded by a rejected subscription-window event advances selection; credit-required long-context denials, warnings, ordinary errors and cancellation do not. The bridge returns a rate-limit error for Pi's default retry handling rather than retrying internally. The next provider call uses the selected eligible profile and continues from Pi's history, including recorded tool results, instead of replaying completed tools. Pi's retry settings and retry budget still apply.
+
+Rejected profiles are skipped until their reported reset time, then become eligible on a later call. Without a finite reset time, they remain rejected for this bridge process's lifetime. The selection and dated rejections are shared across bridge processes through `account-state/`; each process writes only its own file, so concurrent updates are not lost. Rejections without a reset time stay in the process that saw them. When no eligible profile remains, the error is `Claude account profiles exhausted. No eligible account remains.`; rotation does not loop through exhausted accounts.
+
+**Limits:** `accountProfiles` applies to normal provider turns and isolated one-off calls (compaction summaries, session titles), which retry on the next account within the call. AskClaude does not use this rotation path. Invalid or missing profile credentials fail the call rather than silently choosing another account.
 
 **Startup notice:** the first session lists `provider.plan` and `askClaude.enabled` if unset, then records `startupNoticeShown` in the global config so it doesn't nag again.
 
