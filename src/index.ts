@@ -911,6 +911,16 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 //
 // Log strings still say "Case 1/2/3/4" so existing diagnostics (int-cache.sh,
 // int-session-resume.mjs) keep grepping the same anchors.
+	/** The "(none)" bucket's mirror when a shorter context is an unrelated short caller, not a rewrite. */
+	function findShorterUnownedMirror(
+	sharedSession: SessionState | null,
+	priorCount: number,
+	piSessionId: string | null | undefined,
+): SessionState | undefined {
+	if (piSessionId != null || !sharedSession || sharedSession.needsRebuild) return undefined;
+	return priorCount < sharedSession.cursor ? sharedSession : undefined;
+}
+
 	function syncSharedSession(
 	messages: Context["messages"],
 	cwd: string,
@@ -958,9 +968,10 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// runtime-only messages such as the end_turn nudge can disappear without a
 	// history-rewrite event. Neither case may REUSE the longer CC history (issue #25).
 	// Isolated summaries never reach this function.
-	if (piSessionId == null && sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
-		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+	const unownedMirror = findShorterUnownedMirror(sharedSession, priorMessages.length, piSessionId);
+	if (unownedMirror) {
+		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${unownedMirror.sessionId.slice(0, 8)}, cursor=${unownedMirror.cursor}`);
+		debug(`syncResult: path=clean-start preserve-shared sessionId=${unownedMirror.sessionId} cursor=${unownedMirror.cursor}`);
 		return { sessionId: null, preserveSharedSession: true };
 	}
 
