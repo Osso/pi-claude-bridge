@@ -1912,6 +1912,25 @@ function closeActiveQueries(piSessionId: string | null, reason: string): void {
 	}
 }
 
+/** pi ended its run on a tool call (end_turn or another terminating tool), so it will never make
+ *  the provider call that answers it. Answer it here with pi's recorded result and let the
+ *  PostToolBatch hook stop CC before another model request. Otherwise the next prompt would answer
+ *  it instead, with the new user message attached as a mid-turn steer the model treats as an aside.
+ *  Awaited at agent_end, which pi awaits before starting the next prompt. */
+async function closeEndedTurn(piSessionId: string | null, runMessages: Context["messages"]): Promise<void> {
+	const lastAssistant = [...runMessages].reverse().find((message) => message.role === "assistant");
+	if ((lastAssistant as AssistantMessage | undefined)?.stopReason !== "toolUse") return;
+	const { results } = _extractAllToolResults(runMessages as unknown as Array<{ role: string; [key: string]: unknown }>);
+	const c = contextForToolResults(results);
+	if (!c || c.piSessionId !== piSessionId || !c.activeQuery) return;
+	c.turnEnded = true;
+	// The ended turn's tool call and results are now in CC's session; the next prompt resumes past them.
+	c.latestCursor += 1 + results.length;
+	debug(`provider: pi run ended on ${results.length} tool result(s); closing the CC turn`);
+	await deliverToolResults(c, results, null, c.latestCursor);
+	await c.settled?.catch(() => {});
+}
+
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -2088,7 +2107,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// query's stdin, not just mismatching a map.
 	queryCtx.turnToolCallIds = [];
 	queryCtx.resetTurnState(model);
-	queryCtx.latestCursor = 0;
+	// The prompt's own history, so closeEndedTurn can count the ended turn's messages on top.
+	queryCtx.latestCursor = context.messages.length;
+	queryCtx.turnEnded = false;
 	// The served pi session, for rewrite attribution on delivery (issue #101
 	// follow-up) and on SessionState. A fresh instance of this module inside a
 	// worktree-spawned subagent has its own contexts; each records its own.
@@ -2223,6 +2244,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			append: systemPromptAppend ? systemPromptAppend : undefined,
 		},
 		extraArgs,
+		// Ends CC's turn after the tool batch that ended pi's run, without another model
+		// request (pinned by tests/int-cc-contracts.mjs). Other batches continue as usual.
+		hooks: { PostToolBatch: [{ hooks: [async () => (queryCtx.turnEnded ? { continue: false } : {})] }] },
 		...(effort ? { effort } : {}),
 		...(mcpServers ? { mcpServers } : {}),
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
@@ -2268,7 +2292,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// Background consumer — runs until query ends
-	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
+	queryCtx.settled = consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
 		.finally(() => settleQueryAccount(queryCtx, sdkQuery, account, wasAborted || options?.signal?.aborted))
 		.then(async ({ capturedSessionId }) => {
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
@@ -2711,6 +2735,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
+	pi.on("agent_end", (event, ctx) =>
+		closeEndedTurn(ctx.sessionManager.getSessionId(), event.messages as Context["messages"]));
 	pi.on("session_shutdown", (_event, ctx) => {
 		reportLeaks("session_shutdown");
 		closeActiveQueries(ctx.sessionManager.getSessionId(), "pi session shut down");

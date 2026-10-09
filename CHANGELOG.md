@@ -2,6 +2,8 @@
 
 ## UNRELEASED
 
+- **Fix: replies missing after a turn ends on a tool** — when pi's run ends on a terminating tool (`end_turn`), Claude Code stayed parked on that call, and the next prompt reached it as a mid-turn steer ("address it as you continue this turn"), which the model often answered only in thinking. At `agent_end` the bridge now answers the call with pi's recorded result and a `PostToolBatch` hook stops CC without another model request, so the next prompt is a normal user turn on the same session.
+
 - **Tests: unit suite runs in a throwaway home** — the preload sets `HOME` to a temp dir and clears inherited `PI_CODING_AGENT_DIR`/`CLAUDE_CONFIG_DIR`, so tests never load the developer's `accountProfiles`, read real Claude credentials, or write test quota rejections into the shared account state.
 
 - **Add: current-account Claude `/usage` reporting** — Pi's built-in dispatcher event `claude-bridge:usage-request` reports selected-account subscription windows and UTC reset times from Anthropic's OAuth usage API without switching accounts. Bounded transient retries honor `Retry-After`; unresolved HTTP 429 reports the API status and retry timing. `/usage reset` is unsupported for Claude.
