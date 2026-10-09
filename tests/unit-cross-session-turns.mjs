@@ -18,6 +18,7 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { getSessionPath } from "cc-session-io";
 import { tmpdir } from "node:os";
@@ -39,6 +40,7 @@ const { setQuery, getSharedSession, resetSharedSession } = __test;
 const mod = await import("../src/index.js");
 let providerConfig;
 mod.default({
+	events: new EventEmitter(),
 	on: () => {},
 	registerProvider: (_name, config) => { providerConfig = config; },
 	registerTool: () => {},

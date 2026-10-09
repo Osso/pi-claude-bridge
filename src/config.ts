@@ -23,6 +23,8 @@ export interface Config {
 	};
 	/** Low-level Claude Agent SDK plumbing. Most users won't need these. */
 	provider?: {
+		/** Ordered named credential profiles; rotation requires an explicit quota rejection. */
+		accountProfiles?: string[];
 		strictMcpConfig?: boolean;
 		autoMemoryEnabled?: boolean;
 		pathToClaudeCodeExecutable?: string;
