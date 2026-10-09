@@ -1,5 +1,11 @@
 # Changelog
 
+## UNRELEASED
+
+- **Add: current-account Claude `/usage` reporting** — Pi's built-in dispatcher event `claude-bridge:usage-request` reports selected-account subscription windows and UTC reset times from Anthropic's OAuth usage API without switching accounts. Bounded transient retries honor `Retry-After`; unresolved HTTP 429 reports the API status and retry timing. `/usage reset` is unsupported for Claude.
+
+- **Add: opt-in quota-only provider account rotation** — `provider.accountProfiles` selects explicit existing named profiles with per-subprocess `CLAUDE_CONFIG_DIR` credential isolation and refresh writeback. Explicit quota failures advance to an eligible account for Pi's default retry, continuing from recorded tool results. Rejected accounts become eligible at their reported reset time; missing reset times remain blocked for the process lifetime, and exhaustion stops rotation. The selected account and dated rejections persist in `~/.config/pi-claude-bridge/account-state/` (one file per process, merged on read), shared by every bridge process, so new and restarted sessions start on the account that last worked instead of retrying an exhausted one. Isolated one-off calls (compaction summaries, session titles) use the same selection and rotate within the call on a quota rejection. AskClaude is not covered.
+
 ## 0.9.2 — 2026-10-07
 
 - **Fix: synthetic failure notices no longer stream as assistant output (#162)** — keeps pre-output failover working for consumers like pi-model-fallback-alias; the notice text stays on the failed turn's error event. A notice following a stalled stream also drops the dead stream's abandoned partial blocks.

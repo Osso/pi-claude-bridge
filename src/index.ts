@@ -1,11 +1,12 @@
-import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type Api, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
-import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
+import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { debugLogPath, diagLogPath } from "./log-paths.js";
@@ -13,7 +14,8 @@ import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSetti
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx } from "./query-state.js";
+import { ACCOUNTS_EXHAUSTED, AccountProfileManager, QueryContext, ctx } from "./query-state.js";
+import { prepareAccountProfile, persistAccountProfile, readAccountState, updateAccountState } from "./account-profiles.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import {
@@ -28,6 +30,7 @@ import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
+import { reportClaudeUsage, type UsageAccount, type UsageRequest } from "./claude-usage.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -131,6 +134,126 @@ const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 // MODELS is buildModels(getModels("anthropic")) — projection kept in models.js.
 const MODELS = buildModels(getModels("anthropic"));
 let providerSettings: NonNullable<Config["provider"]> = {};
+let accountProfileManager: AccountProfileManager | undefined;
+const quotaRetrySessions = new Set<string | null>();
+// SDKRateLimitInfo subscription windows; overage/credit gates do not exhaust accounts.
+const SUBSCRIPTION_QUOTA_WINDOWS = new Set([
+	"five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included",
+]);
+
+function readActiveAccountProfile(home: string, configDir = join(home, ".claude")): string | undefined {
+	try {
+		return readFileSync(join(configDir, ".active-profile"), "utf8").trim();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw new Error("Cannot read Claude active profile marker");
+	}
+}
+
+function readCurrentUsageAccount(): UsageAccount | undefined {
+	const home = homedir();
+	const names = providerSettings.accountProfiles;
+	if (names === undefined) {
+		const configDir = process.env.CLAUDE_CONFIG_DIR;
+		const active = readActiveAccountProfile(home, configDir);
+		return { home, name: active || "current", configDir };
+	}
+	if (!Array.isArray(names)) throw new Error("Invalid Claude account profiles configuration");
+	const name = accountProfileManager
+		? accountProfileManager.selectedProfile
+		: createAccountProfileManager(names, home).selectedProfile;
+	return name === undefined ? undefined : { home, name, profile: name };
+}
+
+function createAccountProfileManager(names: readonly string[], home: string): AccountProfileManager {
+	return new AccountProfileManager(names, readActiveAccountProfile(home), {
+		read: () => readAccountState(home),
+		update: (change) => updateAccountState(home, change),
+	});
+}
+
+function prepareProviderAccount() {
+	const names = providerSettings.accountProfiles;
+	if (names === undefined) return undefined;
+	if (!Array.isArray(names)) throw new Error("provider.accountProfiles must be an ordered list of profile names");
+	const home = homedir();
+	accountProfileManager ??= createAccountProfileManager(names, home);
+	const name = accountProfileManager.select(Date.now() / 1000);
+	if (name === undefined) throw new Error(ACCOUNTS_EXHAUSTED);
+	return { home, name, manager: accountProfileManager, configDir: prepareAccountProfile(home, name) };
+}
+
+function rejectQueryAccount(queryCtx: QueryContext, rejection: { resetsAt?: number }): boolean {
+	const profile = queryCtx.accountProfile;
+	if (!profile) return true;
+	const next = profile.manager.reject(profile.name, rejection.resetsAt, Date.now() / 1000);
+	if (next === undefined) return false;
+	quotaRetrySessions.add(queryCtx.piSessionId);
+	return true;
+}
+
+function isSubscriptionQuotaRejection(rejection: NonNullable<QueryContext["rateLimitRejection"]>): boolean {
+	return rejection.errorCode !== "credits_required"
+		&& SUBSCRIPTION_QUOTA_WINDOWS.has(rejection.rateLimitType ?? "");
+}
+
+function settleQueryAccount(
+	queryCtx: QueryContext,
+	sdkQuery: ReturnType<typeof query>,
+	account: ReturnType<typeof prepareProviderAccount>,
+	cancelled: boolean | undefined,
+): void {
+	const quotaFailure = queryCtx.quotaFailure;
+	const shouldReject = !cancelled && !abandonedQueries.has(sdkQuery);
+	if (shouldReject && quotaFailure) {
+		const hasEligibleAccount = rejectQueryAccount(queryCtx, quotaFailure);
+		if (!hasEligibleAccount && queryCtx.turnOutput) {
+			queryCtx.turnOutput.errorMessage = ACCOUNTS_EXHAUSTED;
+		}
+	}
+	// Save refreshes before publishing completion, including cancellation and SDK failure.
+	try {
+		if (account) persistAccountProfile(account.home, account.name);
+	} catch (error) {
+		if (queryCtx.turnOutput) queryCtx.turnOutput.errorMessage = errorMessage(error);
+		throw error;
+	}
+}
+
+function failQueryStartup(
+	queryCtx: QueryContext,
+	promptStream: PromptStream,
+	account: ReturnType<typeof prepareProviderAccount>,
+	error: unknown,
+): void {
+	let failure = error;
+	try {
+		if (account) persistAccountProfile(account.home, account.name);
+	} catch (persistError) {
+		failure = persistError;
+	}
+	promptStream.fail(new Error("Query startup failed"));
+	queryCtx.promptStream = null;
+	if (queryCtx.turnOutput) {
+		queryCtx.turnOutput.stopReason = "error";
+		queryCtx.turnOutput.errorMessage = errorMessage(failure);
+	}
+	finalizeCurrentStream(queryCtx, "error");
+}
+
+function emitAccountPreparationFailure(
+	stream: AssistantMessageEventStream,
+	model: Model<Api>,
+	error: unknown,
+): void {
+	const output = newAssistantOutput(model, "", "error", errorMessage(error));
+	queueMicrotask(() => {
+		stream.push({ type: "error", reason: "error", error: output });
+		markStreamComplete(stream);
+		stream.end();
+	});
+}
+
 let longContextSettings: LongContextSettings = { plan: "pro", longContextExtraUsage: false };
 
 function resolveModel(input: string) {
@@ -525,6 +648,51 @@ function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
+interface IsolatedAttempt {
+	text: string;
+	errorText?: string;
+	rejection?: NonNullable<QueryContext["rateLimitRejection"]>;
+}
+
+/** Drain one isolated query: its text, its failure, and the rate-limit rejection that caused it. */
+async function consumeIsolatedQuery(
+	sdkQuery: ReturnType<typeof query>,
+	model: Model<any>,
+	aborted: () => boolean,
+): Promise<IsolatedAttempt> {
+	let assistantText = "";
+	let finalText = "";
+	let errorText: string | undefined;
+	let rejection: IsolatedAttempt["rejection"];
+	let failureRejection: IsolatedAttempt["rejection"];
+	let firstEventLogged = false;
+	for await (const message of sdkQuery) {
+		if (!firstEventLogged) {
+			debug(`compact summary: first event type=${message.type}`);
+			firstEventLogged = true;
+		}
+		if (aborted()) break;
+
+		if (message.type === "assistant") {
+			for (const block of (message as any).message?.content ?? []) {
+				if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
+			}
+		} else if (message.type === "rate_limit_event") {
+			const info = (message as any).rate_limit_info;
+			if (info?.status === "rejected") rejection = info;
+		} else if (message.type === "result") {
+			logServedContextWindow("compact summary", message, model);
+			errorText = resultErrorText(message);
+			// A rejection belongs only to the failure Claude Code sends next.
+			failureRejection = errorText ? rejection : undefined;
+			rejection = undefined;
+			if (errorText && failureRejection) errorText = describeRateLimitFailure(failureRejection, errorText);
+			if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
+		}
+	}
+	return { text: finalText || assistantText, errorText, rejection: failureRejection };
+}
+
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	void runIsolatedSummary(model, context, options, stream);
@@ -567,50 +735,50 @@ async function runIsolatedSummary(
 		const cliModel = claudeCodeModelId(model, longContextSettings);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
-		sdkQuery = query({
-			prompt: promptText,
-			options: {
-				cwd,
-				env: { ...process.env, ...CC_CHILD_ENV },
-				settings: { autoMemoryEnabled: false },
-				tools: [],
-				strictMcpConfig: true,
-				settingSources: [] as SettingSource[],
-				skills: [],
-				persistSession: false,
-				systemPrompt: context.systemPrompt,
-				model: cliModel,
-				maxTurns: 1,
-				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-				...makeCliDebugOptions("compact-summary"),
-			},
-		});
-
 		if (options?.signal) {
 			if (options.signal.aborted) onAbort();
 			else options.signal.addEventListener("abort", onAbort, { once: true });
 		}
 
-		let assistantText = "";
 		let finalText = "";
 		let errorText: string | undefined;
-		let firstEventLogged = false;
-
-		for await (const message of sdkQuery) {
-			if (!firstEventLogged) {
-				debug(`compact summary: first event type=${message.type}`);
-				firstEventLogged = true;
+		// One attempt per eligible account: a one-off request has no Pi retry to rotate on.
+		for (;;) {
+			const account = prepareProviderAccount();
+			let attempt: IsolatedAttempt;
+			try {
+				sdkQuery = isolatedQueryImpl({
+					prompt: promptText,
+					options: {
+						cwd,
+						env: { ...process.env, ...CC_CHILD_ENV, ...(account ? { CLAUDE_CONFIG_DIR: account.configDir } : {}) },
+						settings: { autoMemoryEnabled: false },
+						tools: [],
+						strictMcpConfig: true,
+						settingSources: [] as SettingSource[],
+						skills: [],
+						persistSession: false,
+						systemPrompt: context.systemPrompt,
+						model: cliModel,
+						maxTurns: 1,
+						...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+						...makeCliDebugOptions("compact-summary"),
+					},
+				});
+				if (wasAborted) onAbort();
+				attempt = await consumeIsolatedQuery(sdkQuery, model, () => wasAborted);
+			} finally {
+				if (account) persistAccountProfile(account.home, account.name);
 			}
-			if (wasAborted) break;
-
-			if (message.type === "assistant") {
-				for (const block of (message as any).message?.content ?? []) {
-					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
-				}
-			} else if (message.type === "result") {
-				logServedContextWindow("compact summary", message, model);
-				errorText = resultErrorText(message);
-				if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
+			finalText = attempt.text;
+			errorText = attempt.errorText;
+			const quotaRejection = attempt.rejection && isSubscriptionQuotaRejection(attempt.rejection) ? attempt.rejection : undefined;
+			if (wasAborted || !errorText || !account || !quotaRejection) break;
+			const next = account.manager.reject(account.name, quotaRejection.resetsAt, Date.now() / 1000);
+			debug(`compact summary: ${account.name} quota rejected; ${next ? `retrying on ${next}` : "no account left"}`);
+			if (next === undefined) {
+				errorText = ACCOUNTS_EXHAUSTED;
+				break;
 			}
 		}
 
@@ -622,7 +790,7 @@ async function runIsolatedSummary(
 			return;
 		}
 
-		const text = finalText || assistantText;
+		const text = finalText;
 		if (errorText || !text.trim()) {
 			const msg = errorText ?? "Claude Code summary returned empty text";
 			debug(`compact summary: error ${msg}`);
@@ -635,6 +803,12 @@ async function runIsolatedSummary(
 		stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, text, "stop") });
 		stream.end();
 	} catch (err) {
+		if (wasAborted) {
+			debug("compact summary: aborted while the query threw", err);
+			stream.push({ type: "error", reason: "aborted", error: newAssistantOutput(model, "", "aborted", "Operation aborted") });
+			stream.end();
+			return;
+		}
 		const msg = errorMessage(err);
 		debug("runIsolatedSummary threw; pushing terminal error", err);
 		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
@@ -847,11 +1021,21 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 // path calls the real query() directly — its subprocess must never be swapped
 // out from under a real compaction.
 let queryImpl: typeof query = query;
+// The isolated one-off path's query(); a separate test-only seam so main-path doubles never
+// replace a real compaction subprocess.
+let isolatedQueryImpl: typeof query = query;
 
 // @internal
 export const __test = {
 	setQuery(fn: typeof query | null) {
 		queryImpl = fn ?? query;
+	},
+	setIsolatedQuery(fn: typeof query | null) {
+		isolatedQueryImpl = fn ?? query;
+	},
+	resetAccountProfiles() {
+		accountProfileManager = undefined;
+		quotaRetrySessions.clear();
 	},
 	resetSharedSession(piSessionId?: string | null) {
 		// No id: full reset (the pre-map semantics — tests start from a blank slate).
@@ -1475,12 +1659,14 @@ async function consumeQuery(
 			queryCtx.promptStream?.end();
 			logServedContextWindow("result", message, model);
 			resultError = resultErrorText(message);
+			const rejection = queryCtx.rateLimitRejection;
+			queryCtx.rateLimitRejection = null;
 			if (resultError !== undefined) {
 				// Consume the rejection alongside the failure it caused, so a later
 				// unrelated failure on this query doesn't inherit the label.
-				if (queryCtx.rateLimitRejection) {
-					resultError = describeRateLimitFailure(queryCtx.rateLimitRejection, resultError);
-					queryCtx.rateLimitRejection = null;
+				if (rejection) {
+					if (isSubscriptionQuotaRejection(rejection)) queryCtx.quotaFailure = rejection;
+					resultError = describeRateLimitFailure(rejection, resultError);
 				}
 				debug(`consumeQuery: error result, subtype=${message.subtype}, error=${resultError}`);
 				if (queryCtx.turnOutput) {
@@ -1715,6 +1901,30 @@ function discardRewrittenQuery(c: QueryContext): void {
 	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
 }
 
+/** Close Claude Code queries owned by the pi session shutting down.
+ *
+ *  A tool whose result ends pi's turn (`terminate: true`) leaves its MCP handler
+ *  parked: pi never makes the provider call that would deliver the result. On a
+ *  signal, pi's teardown kills the child; a clean exit (print mode) has nothing
+ *  else that will, and the live subprocess keeps pi's event loop running. */
+function closeActiveQueries(piSessionId: string | null, reason: string): void {
+	for (const c of activeQueryContexts) {
+		if (c.piSessionId !== piSessionId) continue;
+		const open = c.activeQuery as { interrupt?: () => Promise<unknown>; close?: () => void } | null;
+		if (open) abandonedQueries.add(open);
+		c.activeQuery = null;
+		c.turnToolCallIds = [];
+		c.promptStream?.fail(new Error(reason));
+		c.promptStream = null;
+		// Settle parked handlers before killing the CLI: one left awaiting a dead
+		// subprocess never settles.
+		c.releasePendingToolCalls(reason);
+		void open?.interrupt?.().catch(() => {});
+		try { open?.close?.(); } catch {}
+		activeQueryContexts.delete(c);
+	}
+}
+
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -1736,6 +1946,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	const stream = createAssistantMessageEventStream();
+	const quotaRetry = quotaRetrySessions.has(options?.sessionId ?? null);
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
@@ -1744,6 +1955,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let activeQuery = ctx().activeQuery !== null;
 	const allResults = activeQueryContexts.size > 0 ? extractAllToolResults(context) : [];
 	let resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
+	// Pi can retry as soon as the error stream ends, before the old query's
+	// final cleanup removes its tool ids. Those results belong to a fresh query.
+	if (quotaRetry && resultCtx?.quotaFailure) resultCtx = undefined;
 
 	// pi rewrote its history while this query sat parked at a tool boundary, so the
 	// query answers about a conversation that no longer exists. Discard it and let
@@ -1800,7 +2014,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// branch above already siphoned off the stale-query case, which goes on to a
 	// rebuild instead — that one has somewhere to deliver the result to.
 	const lastMsg = context.messages[context.messages.length - 1];
-	if (lastMsg?.role === "toolResult" && !rewrittenUnderQuery) {
+	if (lastMsg?.role === "toolResult" && !rewrittenUnderQuery && !quotaRetry) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		// With no query in flight anywhere, the top-level session this result
 		// belongs to is the one whose turn just ended: its cursor advances to
@@ -1843,6 +2057,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// transformContext after turn_start, so ctx.getSystemPrompt() is not the head.
 	let promptCapture: PromptCapture | undefined;
 	let systemPromptAppend: string | undefined;
+	let account: ReturnType<typeof prepareProviderAccount>;
+	try {
+		account = prepareProviderAccount();
+	} catch (error) {
+		emitAccountPreparationFailure(stream, model, error);
+		return stream;
+	}
 	try {
 		promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
 		systemPromptAppend = promptCapture
@@ -1890,6 +2111,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// from the set, not from here) and re-discard a healthy query.
 	queryCtx.historyStale = false;
 	queryCtx.missedSteer = false;
+	queryCtx.rateLimitRejection = null;
+	queryCtx.quotaFailure = null;
+	queryCtx.accountProfile = account ? { name: account.name, manager: account.manager } : null;
+	quotaRetrySessions.delete(queryCtx.piSessionId);
 
 	const cwd = process.cwd();
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
@@ -1911,7 +2136,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// recovery below — that one is for a shape we do not expect, and this is one
 	// we do. The rebuilt session already ends with the tool result, placed after
 	// the tool call it answers.
-	if (rewrittenUnderQuery && !promptText && !promptBlocks) {
+	if ((rewrittenUnderQuery || quotaRetry) && !promptText && !promptBlocks) {
 		promptText = CONTINUE_AFTER_REWRITE_PROMPT;
 		debug(`provider: continuing the turn after a rewritten history, ${context.messages.length} msgs rebuilt`);
 	}
@@ -1982,7 +2207,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...process.env, ...CC_CHILD_ENV };
+	const childEnv = {
+		...process.env, ...CC_CHILD_ENV,
+		...(account ? { CLAUDE_CONFIG_DIR: account.configDir } : {}),
+	};
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
@@ -2023,7 +2251,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
-	const sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions });
+	let sdkQuery: ReturnType<typeof query>;
+	try {
+		sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions });
+	} catch (error) {
+		failQueryStartup(queryCtx, promptStream, account, error);
+		return stream;
+	}
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
 
@@ -2048,6 +2282,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// Background consumer — runs until query ends
 	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
+		.finally(() => settleQueryAccount(queryCtx, sdkQuery, account, wasAborted || options?.signal?.aborted))
 		.then(async ({ capturedSessionId }) => {
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
@@ -2365,6 +2600,19 @@ const PREVIEW_MAX_LINES = 6;
 
 let askClaudeToolName = "AskClaude";
 
+function registerClaudeUsageListener(pi: ExtensionAPI): void {
+	const unsubscribeUsage = pi.events.on("claude-bridge:usage-request", payload => {
+		const request = payload as UsageRequest;
+		if (request.handled !== undefined) return;
+		request.handled = reportClaudeUsage(request.args, request.ctx, readCurrentUsageAccount, report => {
+			pi.sendMessage({ customType: "claude-usage", content: report, display: true });
+		});
+	});
+	pi.on("session_shutdown", () => {
+		unsubscribeUsage();
+	});
+}
+
 export default function (pi: ExtensionAPI) {
 	// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
@@ -2372,6 +2620,7 @@ export default function (pi: ExtensionAPI) {
 	const config = loadConfig(process.cwd());
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
+	registerClaudeUsageListener(pi);
 	// We need these settings to know if we're eligible for 1M context on certain models
 	// Validate at the boundary: a non-array here would throw inside every
 	// claudeCodeModelId call and brick the extension at activation.
@@ -2475,8 +2724,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		reportLeaks("session_shutdown");
+		closeActiveQueries(ctx.sessionManager.getSessionId(), "pi session shut down");
 		clearSession("session_shutdown");
 	});
 

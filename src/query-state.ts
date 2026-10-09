@@ -7,8 +7,91 @@
 // Extracted from index.ts so tests can import without activating the extension.
 
 import type { AssistantMessage, AssistantMessageEventStream, Model } from "@earendil-works/pi-ai";
+import type { SDKRateLimitInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { McpResult } from "./extract-tool-results.js";
 import type { PromptStream } from "./prompt-stream.js";
+import { type AccountState, nextAccountProfile } from "./account-profiles.js";
+
+export const ACCOUNTS_EXHAUSTED = "Claude account profiles exhausted. No eligible account remains.";
+
+export interface AccountStateStore {
+	read(): AccountState | undefined;
+	/** Applies `change` to the latest shared state and publishes the result. */
+	update(change: (state: AccountState | undefined) => AccountState): void;
+}
+
+/**
+ * Quota state shared by concurrent provider queries and, through the store, by every bridge
+ * process, so a restarted Pi keeps the account that last worked instead of retrying an exhausted
+ * one. Times are Unix seconds. A rejection without a reset time stays process-local: persisting
+ * it would lock the account out of every future process.
+ */
+export class AccountProfileManager {
+	private rejected = new Map<string, number>();
+	private blocked = new Set<string>();
+	private current: string | undefined;
+
+	constructor(private names: readonly string[], active: string | undefined, private store?: AccountStateStore) {
+		const first = nextAccountProfile(names, []);
+		this.current = active !== undefined && names.includes(active) ? active : first;
+	}
+
+	get selectedProfile(): string | undefined {
+		const state = this.store?.read();
+		if (state) this.loadSharedState(state);
+		return this.current;
+	}
+
+	select(now: number): string | undefined {
+		return this.withSharedState(() => this.selectLoaded(now));
+	}
+
+	reject(name: string, resetsAt: number | undefined, now: number): string | undefined {
+		return this.withSharedState(() => {
+			if (resetsAt !== undefined && Number.isFinite(resetsAt)) {
+				this.rejected.set(name, Math.max(this.rejected.get(name) ?? -Infinity, resetsAt));
+			} else {
+				this.blocked.add(name);
+			}
+			// A late rejection from an old account must not skip a healthy current account.
+			return this.selectLoaded(now);
+		});
+	}
+
+	/** Runs one decision against the latest shared state and publishes the result. */
+	private withSharedState<T>(decide: () => T): T {
+		if (!this.store) return decide();
+		let result!: T;
+		this.store.update((state) => {
+			if (state) this.loadSharedState(state);
+			result = decide();
+			return {
+				...(this.current === undefined ? {} : { current: this.current }),
+				rejected: Object.fromEntries(this.rejected),
+			};
+		});
+		return result;
+	}
+
+	private selectLoaded(now: number): string | undefined {
+		for (const [name, resetsAt] of this.rejected) {
+			if (resetsAt <= now) this.rejected.delete(name);
+		}
+		const unavailable = new Set([...this.rejected.keys(), ...this.blocked]);
+		if (this.current !== undefined && !unavailable.has(this.current)) return this.current;
+		const next = nextAccountProfile(this.names, unavailable);
+		if (next !== undefined) this.current = next;
+		return next;
+	}
+
+	/** Another process's selection and rejections win over this process's stale view. */
+	private loadSharedState(state: AccountState): void {
+		for (const [name, resetsAt] of Object.entries(state.rejected)) {
+			if (this.names.includes(name)) this.rejected.set(name, Math.max(this.rejected.get(name) ?? -Infinity, resetsAt));
+		}
+		if (state.current !== undefined && this.names.includes(state.current)) this.current = state.current;
+	}
+}
 
 export interface PendingToolCall {
 	toolName: string;
@@ -30,7 +113,11 @@ export class QueryContext {
 	promptStream: PromptStream | null = null;
 	/** Last rate-limit rejection seen on this query. Claude Code sends it just before the
 	 *  failure it caused, which is the only thing tying the two together. */
-	rateLimitRejection: { rateLimitType?: string; resetsAt?: number } | null = null;
+	rateLimitRejection: Pick<SDKRateLimitInfo, "rateLimitType" | "resetsAt" | "errorCode"> | null = null;
+	/** Identity stays with the query even when a concurrent query advances selection. */
+	accountProfile: { name: string; manager: AccountProfileManager } | null = null;
+	/** Quota failure awaits query settlement so cancellation never rejects an account. */
+	quotaFailure: { resetsAt?: number } | null = null;
 	/** Highest 5% utilization bucket we notified for, so repeat rate_limit_event spam is suppressed. */
 	lastRateLimitWarnStep: number | null = null;
 	lastRateLimitWarnThreshold: number | undefined;
