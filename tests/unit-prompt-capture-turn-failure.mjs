@@ -6,6 +6,7 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +27,7 @@ const { PI_PREAMBLE } = await import("../src/prompt-capture.js");
 
 let providerConfig;
 activate({
+	events: new EventEmitter(),
 	on: () => {},
 	registerProvider: (_name, config) => { providerConfig = config; },
 	registerTool: () => {},

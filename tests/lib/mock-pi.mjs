@@ -6,11 +6,13 @@
 // config enables AskClaude (e.g. a developer's global ~/.pi/agent/claude-bridge.json),
 // so a mock missing it throws before any handler is registered. CI has no such
 // config, which is why this only surfaced locally.
+import { EventEmitter } from "node:events";
 const { default: activate } = await import("../../src/index.js");
 
 export function activateWithMockPi(activateFn) {
 	const handlers = new Map();
 	(activateFn ?? activate)({
+		events: new EventEmitter(),
 		on: (event, handler) => handlers.set(event, handler),
 		registerProvider: () => {},
 		registerTool: () => {},
